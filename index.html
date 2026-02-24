@@ -1,0 +1,1141 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>像素火柴人 - 街头乱斗</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap');
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: #0a0a0f;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            overflow: hidden;
+            font-family: 'Press Start 2P', cursive;
+        }
+        #gameContainer {
+            position: relative;
+            width: 800px;
+            height: 450px;
+            border: 4px solid #2a2a4a;
+            box-shadow: 0 0 40px rgba(80, 80, 160, 0.4);
+            background: #1a1a2e;
+        }
+        #gameCanvas {
+            display: block;
+            image-rendering: pixelated;
+            image-rendering: crisp-edges;
+        }
+        #controls {
+            position: fixed;
+            bottom: 10px;
+            left: 50%;
+            transform: translateX(-50%);
+            color: #666;
+            font-size: 8px;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <div id="gameContainer">
+        <canvas id="gameCanvas" width="800" height="450"></canvas>
+    </div>
+    <div id="controls">移动: WASD/方向键 | 攻击: J/Z | 跳跃: K/X | 必杀: L/C | 暂停: ESC</div>
+
+    <script>
+    const canvas = document.getElementById('gameCanvas');
+    const ctx = canvas.getContext('2d');
+    ctx.imageSmoothingEnabled = false;
+
+    // 游戏状态
+    const GameState = { MENU: 0, PLAYING: 1, PAUSED: 2, GAMEOVER: 3, WIN: 4 };
+    let gameState = GameState.MENU;
+    let menuSelection = 0;
+    let level = 1;
+    let wave = 1;
+    let stateFrame = 0;
+    let screenShake = 0;
+    let hitStop = 0;
+
+    // 音频
+    let audioCtx = null;
+    function initAudio() {
+        if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+
+    function playSound(type) {
+        if (!audioCtx) return;
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+
+        if (type === 'hit') {
+            osc.type = 'square';
+            osc.frequency.setValueAtTime(150, audioCtx.currentTime);
+            osc.frequency.exponentialRampToValueAtTime(50, audioCtx.currentTime + 0.1);
+            gain.gain.setValueAtTime(0.3, audioCtx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.1);
+            osc.start();
+            osc.stop(audioCtx.currentTime + 0.1);
+        } else if (type === 'jump') {
+            osc.type = 'square';
+            osc.frequency.setValueAtTime(200, audioCtx.currentTime);
+            osc.frequency.exponentialRampToValueAtTime(400, audioCtx.currentTime + 0.1);
+            gain.gain.setValueAtTime(0.2, audioCtx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.1);
+            osc.start();
+            osc.stop(audioCtx.currentTime + 0.1);
+        } else if (type === 'skill') {
+            osc.type = 'sawtooth';
+            osc.frequency.setValueAtTime(100, audioCtx.currentTime);
+            osc.frequency.exponentialRampToValueAtTime(800, audioCtx.currentTime + 0.3);
+            gain.gain.setValueAtTime(0.3, audioCtx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.3);
+            osc.start();
+            osc.stop(audioCtx.currentTime + 0.3);
+        } else if (type === 'enemyDeath') {
+            osc.type = 'square';
+            osc.frequency.setValueAtTime(300, audioCtx.currentTime);
+            osc.frequency.exponentialRampToValueAtTime(50, audioCtx.currentTime + 0.15);
+            gain.gain.setValueAtTime(0.25, audioCtx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.15);
+            osc.start();
+            osc.stop(audioCtx.currentTime + 0.15);
+        }
+    }
+
+    // 像素绘制工具
+    function drawPixelRect(x, y, w, h, color) {
+        ctx.fillStyle = color;
+        ctx.fillRect(Math.floor(x), Math.floor(y), w, h);
+    }
+
+    // 玩家
+    const player = {
+        x: 100, y: 350, width: 32, height: 48,
+        vx: 0, vy: 0,
+        speed: 4, jumpForce: 12,
+        hp: 100, maxHp: 100,
+        energy: 50, maxEnergy: 50,
+        direction: 1,
+        state: 'idle',
+        frame: 0,
+        attackFrame: 0,
+        combo: 0,
+        invincible: 0,
+        attackBox: null,
+        grounded: false
+    };
+
+    // 敌人
+    let enemies = [];
+    const enemyTypes = {
+        grunt: { hp: 30, speed: 1.5, damage: 10, width: 24, height: 40, color: '#ff4466' },
+        ranger: { hp: 20, speed: 1, damage: 8, width: 20, height: 36, color: '#44ff66' },
+        brute: { hp: 80, speed: 0.8, damage: 20, width: 36, height: 52, color: '#aa44ff' }
+    };
+
+    // 粒子
+    let particles = [];
+    let damageNumbers = [];
+
+    // 场景元素
+    const levels = [
+        { name: '霓虹贫民窟', bgColor: '#1a1c2c', groundColor: '#2a2a4a', accent: '#ff004d', deco: 'building' },
+        { name: '荒野列车', bgColor: '#2a1a1c', groundColor: '#4a3a2a', accent: '#feae34', deco: 'train' },
+        { name: '科技实验室', bgColor: '#1a2a2c', groundColor: '#2a4a4a', accent: '#00e436', deco: 'lab' }
+    ];
+
+    let cameraX = 0;
+    let levelWalls = { left: 50, right: 750 };
+    let levelObjects = [];
+
+    // 输入
+    const keys = {};
+    document.addEventListener('keydown', e => {
+        keys[e.key.toLowerCase()] = true;
+        if (e.key === 'Escape' && gameState === GameState.PLAYING) {
+            gameState = GameState.PAUSED;
+        } else if (e.key === 'Escape' && gameState === GameState.PAUSED) {
+            gameState = GameState.PLAYING;
+        }
+        if (gameState === GameState.MENU || gameState === GameState.GAMEOVER || gameState === GameState.WIN) {
+            if (e.key === 'Enter' || e.key === ' ') {
+                initAudio();
+                if (gameState === GameState.MENU) startGame();
+                else if (gameState === GameState.GAMEOVER || gameState === GameState.WIN) {
+                    gameState = GameState.MENU;
+                }
+            }
+        }
+        if (gameState === GameState.PAUSED && e.key === 'r') {
+            resetGame();
+            gameState = GameState.PLAYING;
+        }
+    });
+    document.addEventListener('keyup', e => keys[e.key.toLowerCase()] = false);
+
+    function resetGame() {
+        player.x = 100;
+        player.y = 350;
+        player.vx = 0;
+        player.vy = 0;
+        player.hp = 100;
+        player.energy = 50;
+        player.state = 'idle';
+        player.combo = 0;
+        player.invincible = 0;
+        enemies = [];
+        particles = [];
+        damageNumbers = [];
+        wave = 1;
+        cameraX = 0;
+        levelObjects = generateLevelObjects();
+    }
+
+    function startGame() {
+        resetGame();
+        gameState = GameState.PLAYING;
+        spawnWave();
+    }
+
+    function generateLevelObjects() {
+        const lvl = levels[level - 1];
+        const objs = [];
+        if (lvl.deco === 'building') {
+            for (let i = 0; i < 8; i++) {
+                objs.push({ x: 150 + i * 120, y: 380, w: 30, h: 70, type: 'building' });
+            }
+        } else if (lvl.deco === 'train') {
+            for (let i = 0; i < 6; i++) {
+                objs.push({ x: 200 + i * 150, y: 360, w: 80, h: 90, type: 'carriage' });
+            }
+        } else if (lvl.deco === 'lab') {
+            for (let i = 0; i < 10; i++) {
+                objs.push({ x: 100 + i * 100, y: 390, w: 20, h: 60, type: 'tank' });
+            }
+        }
+        return objs;
+    }
+
+    function spawnWave() {
+        const waveEnemies = Math.min(2 + wave * 2, 10);
+        for (let i = 0; i < waveEnemies; i++) {
+            const types = ['grunt', 'grunt', 'ranger', 'brute'];
+            const type = types[Math.floor(Math.random() * Math.min(types.length, 2 + Math.floor(wave / 2)))];
+            const et = enemyTypes[type];
+            enemies.push({
+                x: 500 + Math.random() * 200 + i * 50,
+                y: 400 - et.height,
+                width: et.width,
+                height: et.height,
+                hp: et.hp,
+                maxHp: et.hp,
+                speed: et.speed,
+                damage: et.damage,
+                color: et.color,
+                type: type,
+                state: 'walk',
+                frame: Math.random() * 100,
+                attackCooldown: 0,
+                invincible: 0
+            });
+        }
+    }
+
+    // 绘制像素火柴人
+    function drawStickman(x, y, w, h, color, direction, state, frame) {
+        const cx = x + w / 2;
+        const dir = direction;
+
+        ctx.fillStyle = color;
+
+        // 头部
+        const headSize = h * 0.25;
+        const headY = y;
+        ctx.fillRect(cx - headSize/2 * dir, headY, headSize, headSize);
+
+        // 眼睛
+        ctx.fillStyle = '#fff';
+        const eyeX = dir > 0 ? cx + 2 : cx - headSize/2 + 2;
+        ctx.fillRect(eyeX, headY + headSize*0.3, 3, 3);
+
+        // 身体
+        ctx.fillStyle = color;
+        const bodyTop = headY + headSize;
+        const bodyHeight = h * 0.35;
+        ctx.fillRect(cx - 4 * dir, bodyTop, 8, bodyHeight);
+
+        // 手臂
+        const armY = bodyTop + 5;
+        if (state === 'attack') {
+            // 攻击动作 - 手臂向前伸出
+            ctx.fillRect(cx + 4 * dir, armY, 16 * dir, 4);
+        } else if (state === 'hurt') {
+            // 受击 - 手臂举起
+            ctx.fillRect(cx - 4 * dir, armY - 8, 4, 12);
+            ctx.fillRect(cx + 4 * dir, armY - 8, 4, 12);
+        } else {
+            // 正常 - 手臂下垂摆动
+            const swing = Math.sin(frame * 0.2) * 4;
+            ctx.fillRect(cx - 8 * dir, armY + swing, 4, 12);
+            ctx.fillRect(cx + 4 * dir, armY - swing, 4, 12);
+        }
+
+        // 腿部
+        const legTop = bodyTop + bodyHeight;
+        const legHeight = h * 0.4;
+
+        if (state === 'jump') {
+            // 跳跃 - 腿弯曲
+            ctx.fillRect(cx - 6 * dir, legTop, 4, 10);
+            ctx.fillRect(cx + 2 * dir, legTop, 4, 10);
+        } else if (state === 'attack') {
+            // 攻击 - 腿站稳
+            ctx.fillRect(cx - 6 * dir, legTop, 4, legHeight);
+            ctx.fillRect(cx + 2 * dir, legTop, 4, legHeight);
+        } else {
+            // 行走
+            const walkCycle = Math.sin(frame * 0.3) * 6;
+            ctx.fillRect(cx - 6 * dir + walkCycle, legTop, 4, legHeight);
+            ctx.fillRect(cx + 2 * dir - walkCycle, legTop, 4, legHeight);
+        }
+    }
+
+    // 绘制敌人
+    function drawEnemy(e) {
+        const dir = player.x < e.x ? -1 : 1;
+        const color = e.color;
+
+        ctx.fillStyle = color;
+
+        // 敌人形状根据类型不同
+        if (e.type === 'grunt') {
+            // 红色小怪 - 简单的方块人
+            drawStickman(e.x, e.y, e.width, e.height, color, dir, e.state, e.frame);
+        } else if (e.type === 'ranger') {
+            // 绿色射手 - 稍微瘦小
+            drawStickman(e.x, e.y, e.width, e.height, color, dir, e.state, e.frame);
+        } else if (e.type === 'brute') {
+            // 紫色巨汉 - 更宽大
+            const cx = e.x + e.width / 2;
+            // 更大的身体
+            ctx.fillRect(cx - 10, e.y + 10, 20, 25);
+            // 头
+            ctx.fillRect(cx - 8, e.y, 16, 14);
+            // 眼睛
+            ctx.fillStyle = '#ff0000';
+            ctx.fillRect(cx - 4, e.y + 4, 3, 3);
+            ctx.fillRect(cx + 1, e.y + 4, 3, 3);
+            // 腿
+            ctx.fillStyle = color;
+            ctx.fillRect(cx - 10, e.y + 35, 6, 15);
+            ctx.fillRect(cx + 4, e.y + 35, 6, 15);
+            // 手臂
+            if (e.state === 'attack') {
+                ctx.fillRect(cx + 8, e.y + 15, 14, 6);
+            } else {
+                ctx.fillRect(cx - 14, e.y + 15, 6, 14);
+                ctx.fillRect(cx + 8, e.y + 15, 6, 14);
+            }
+        }
+
+        // 血条
+        if (e.hp < e.maxHp) {
+            ctx.fillStyle = '#333';
+            ctx.fillRect(e.x, e.y - 8, e.width, 4);
+            ctx.fillStyle = '#ff0000';
+            ctx.fillRect(e.x, e.y - 8, e.width * (e.hp / e.maxHp), 4);
+        }
+    }
+
+    // 绘制背景
+    function drawBackground() {
+        const lvl = levels[level - 1];
+
+        // 天空渐变
+        const gradient = ctx.createLinearGradient(0, 0, 0, 450);
+        gradient.addColorStop(0, lvl.bgColor);
+        gradient.addColorStop(1, '#0a0a15');
+        ctx.fillStyle = gradient;
+        ctx.fillRect(0, 0, 800, 450);
+
+        // 远景装饰
+        ctx.fillStyle = lvl.accent + '40';
+        for (let i = 0; i < 20; i++) {
+            const starX = (i * 73 + cameraX * 0.1) % 900 - 50;
+            const starY = 30 + (i * 17) % 80;
+            ctx.fillRect(starX, starY, 2, 2);
+        }
+
+        // 中景建筑/装饰
+        ctx.fillStyle = lvl.accent + '30';
+        for (const obj of levelObjects) {
+            const screenX = obj.x - cameraX * 0.5;
+            if (screenX > -100 && screenX < 900) {
+                if (obj.type === 'building') {
+                    // 霓虹建筑
+                    ctx.fillRect(screenX, obj.y, obj.w, obj.h);
+                    // 窗户
+                    ctx.fillStyle = lvl.accent + '80';
+                    for (let wy = obj.y + 10; wy < obj.y + obj.h - 10; wy += 15) {
+                        ctx.fillRect(screenX + 5, wy, 8, 8);
+                        ctx.fillRect(screenX + 17, wy, 8, 8);
+                    }
+                    ctx.fillStyle = lvl.accent + '30';
+                } else if (obj.type === 'carriage') {
+                    // 列车车厢
+                    ctx.fillRect(screenX, obj.y, obj.w, obj.h);
+                    ctx.fillStyle = '#222';
+                    ctx.fillRect(screenX + 10, obj.y + 10, obj.w - 20, obj.h - 20);
+                    // 轮子
+                    ctx.fillStyle = '#444';
+                    ctx.fillRect(screenX + 10, obj.y + obj.h, 15, 10);
+                    ctx.fillRect(screenX + obj.w - 25, obj.y + obj.h, 15, 10);
+                    ctx.fillStyle = lvl.accent + '30';
+                } else if (obj.type === 'tank') {
+                    // 实验罐
+                    ctx.fillRect(screenX, obj.y, obj.w, obj.h);
+                    ctx.fillStyle = '#00ff8840';
+                    ctx.fillRect(screenX + 3, obj.y + 3, obj.w - 6, obj.h - 6);
+                    // 顶部灯光
+                    ctx.fillStyle = lvl.accent;
+                    ctx.fillRect(screenX + 5, obj.y - 5, obj.w - 10, 3);
+                    ctx.fillStyle = lvl.accent + '30';
+                }
+            }
+        }
+
+        // 地面
+        ctx.fillStyle = lvl.groundColor;
+        ctx.fillRect(0, 400, 800, 50);
+
+        // 地面纹理
+        ctx.fillStyle = lvl.accent + '30';
+        for (let i = 0; i < 40; i++) {
+            const gx = (i * 23 - cameraX % 23) % 800;
+            ctx.fillRect(gx, 405 + (i % 3) * 10, 3, 3);
+        }
+
+        // 地面高光线
+        ctx.fillStyle = lvl.accent + '60';
+        ctx.fillRect(0, 400, 800, 2);
+    }
+
+    // 绘制玩家
+    function drawPlayer() {
+        if (player.invincible > 0 && Math.floor(player.invincible / 3) % 2 === 0) return;
+
+        const dir = player.direction;
+        let state = player.state;
+        if (state === 'idle' && !player.grounded) state = 'fall';
+
+        // 绘制主角 - 橙色火柴人
+        drawStickman(player.x, player.y, player.width, player.height, '#ff9e22', dir, state, player.frame);
+
+        // 绘制攻击特效
+        if (player.attackBox && player.attackFrame < 10) {
+            ctx.fillStyle = '#ffaa00';
+            const atk = player.attackBox;
+            ctx.globalAlpha = 0.5;
+            ctx.fillRect(atk.x, atk.y, atk.w, atk.h);
+            ctx.globalAlpha = 1;
+        }
+
+        // 冲刺残影
+        if (player.state === 'dash') {
+            ctx.globalAlpha = 0.3;
+            drawStickman(player.x - player.vx * 3, player.y, player.width, player.height, '#ff9e22', dir, 'idle', 0);
+            drawStickman(player.x - player.vx * 6, player.y, player.width, player.height, '#ff9e22', dir, 'idle', 0);
+            ctx.globalAlpha = 1;
+        }
+    }
+
+    // 绘制UI
+    function drawUI() {
+        // 生命条
+        ctx.fillStyle = '#333';
+        ctx.fillRect(20, 20, 200, 20);
+        ctx.fillStyle = '#ff4444';
+        ctx.fillRect(22, 22, 196 * (player.hp / player.maxHp), 16);
+        ctx.fillStyle = '#fff';
+        ctx.font = '10px "Press Start 2P"';
+        ctx.fillText('HP', 25, 34);
+
+        // 能量条
+        ctx.fillStyle = '#333';
+        ctx.fillRect(20, 45, 150, 12);
+        ctx.fillStyle = '#4488ff';
+        ctx.fillRect(22, 47, 146 * (player.energy / player.maxEnergy), 8);
+        ctx.fillStyle = '#fff';
+        ctx.fillText('EN', 25, 54);
+
+        // 波次
+        ctx.fillStyle = '#fff';
+        ctx.font = '12px "Press Start 2P"';
+        ctx.textAlign = 'right';
+        ctx.fillText(`WAVE ${wave}`, 780, 30);
+        ctx.textAlign = 'left';
+
+        // 关卡
+        ctx.fillStyle = levels[level - 1].accent;
+        ctx.font = '10px "Press Start 2P"';
+        ctx.fillText(levels[level - 1].name, 20, 75);
+    }
+
+    // 绘制菜单
+    function drawMenu() {
+        drawBackground();
+
+        ctx.fillStyle = '#fff';
+        ctx.textAlign = 'center';
+
+        // 标题
+        ctx.font = '24px "Press Start 2P"';
+        ctx.fillStyle = '#ff004d';
+        ctx.fillText('像素火柴人', 400, 120);
+        ctx.fillStyle = '#29adff';
+        ctx.fillText('街头乱斗', 400, 155);
+
+        // 角色展示
+        drawStickman(350, 220, 48, 72, '#ff9e22', 1, 'idle', stateFrame);
+
+        // 菜单选项
+        ctx.font = '12px "Press Start 2P"';
+        const startY = 340;
+
+        ctx.fillStyle = menuSelection === 0 ? '#ff004d' : '#666';
+        ctx.fillText('▶ 开始游戏', 400, startY);
+
+        ctx.fillStyle = menuSelection === 1 ? '#ff004d' : '#666';
+        ctx.fillText('▶ 操作说明', 400, startY + 35);
+
+        if (menuSelection === 1) {
+            ctx.font = '8px "Press Start 2P"';
+            ctx.fillStyle = '#aaa';
+            ctx.textAlign = 'left';
+            ctx.fillText('WASD/方向键: 移动', 250, 380);
+            ctx.fillText('J/Z: 攻击  K/X: 跳跃', 250, 400);
+            ctx.fillText('L/C: 必杀技  ESC: 暂停', 250, 420);
+            ctx.textAlign = 'center';
+        }
+
+        ctx.fillStyle = '#444';
+        ctx.font = '8px "Press Start 2P"';
+        ctx.fillText('按 ENTER 开始', 400, 440);
+
+        ctx.textAlign = 'left';
+    }
+
+    // 绘制暂停
+    function drawPaused() {
+        ctx.fillStyle = 'rgba(0,0,0,0.7)';
+        ctx.fillRect(0, 0, 800, 450);
+
+        ctx.fillStyle = '#fff';
+        ctx.textAlign = 'center';
+        ctx.font = '20px "Press Start 2P"';
+        ctx.fillText('暂停', 400, 200);
+
+        ctx.font = '10px "Press Start 2P"';
+        ctx.fillText('按 ESC 继续', 400, 250);
+        ctx.fillText('按 R 重新开始', 400, 280);
+
+        ctx.textAlign = 'left';
+    }
+
+    // 绘制游戏结束
+    function drawGameOver() {
+        ctx.fillStyle = 'rgba(0,0,0,0.8)';
+        ctx.fillRect(0, 0, 800, 450);
+
+        ctx.fillStyle = '#ff004d';
+        ctx.textAlign = 'center';
+        ctx.font = '24px "Press Start 2P"';
+        ctx.fillText('游戏结束', 400, 200);
+
+        ctx.fillStyle = '#fff';
+        ctx.font = '12px "Press Start 2P"';
+        ctx.fillText(`到达 Wave ${wave}`, 400, 260);
+
+        ctx.fillStyle = '#666';
+        ctx.font = '10px "Press Start 2P"';
+        ctx.fillText('按 ENTER 返回菜单', 400, 320);
+
+        ctx.textAlign = 'left';
+    }
+
+    // 绘制胜利
+    function drawWin() {
+        ctx.fillStyle = 'rgba(0,0,0,0.8)';
+        ctx.fillRect(0, 0, 800, 450);
+
+        ctx.fillStyle = '#ffd700';
+        ctx.textAlign = 'center';
+        ctx.font = '24px "Press Start 2P"';
+        ctx.fillText('恭喜通关!', 400, 200);
+
+        drawStickman(376, 240, 48, 72, '#ff9e22', 1, 'idle', stateFrame);
+
+        ctx.fillStyle = '#fff';
+        ctx.font = '10px "Press Start 2P"';
+        ctx.fillText(`最终 Wave: ${wave}`, 400, 340);
+
+        ctx.fillStyle = '#666';
+        ctx.fillText('按 ENTER 返回菜单', 400, 380);
+
+        ctx.textAlign = 'left';
+    }
+
+    // 绘制粒子
+    function drawParticles() {
+        for (const p of particles) {
+            ctx.fillStyle = p.color;
+            ctx.globalAlpha = p.life;
+            ctx.fillRect(p.x, p.y, p.size, p.size);
+        }
+        ctx.globalAlpha = 1;
+
+        // 伤害数字
+        for (const d of damageNumbers) {
+            ctx.fillStyle = d.color;
+            ctx.font = '12px "Press Start 2P"';
+            ctx.fillText(d.text, d.x, d.y);
+        }
+    }
+
+    // 更新游戏
+    function update() {
+        stateFrame++;
+
+        if (hitStop > 0) {
+            hitStop--;
+            return;
+        }
+
+        if (screenShake > 0) {
+            screenShake--;
+            ctx.save();
+            ctx.translate(Math.random() * screenShake - screenShake/2, Math.random() * screenShake - screenShake/2);
+        }
+
+        if (player.invincible > 0) player.invincible--;
+        player.frame++;
+
+        // 玩家输入
+        if (player.state !== 'attack' || player.attackFrame > 8) {
+            player.vx = 0;
+            if (keys['a'] || keys['arrowleft']) { player.vx = -player.speed; player.direction = -1; }
+            if (keys['d'] || keys['arrowright']) { player.vx = player.speed; player.direction = 1; }
+
+            if (keys['j'] || keys['z']) {
+                player.state = 'attack';
+                player.attackFrame = 0;
+                player.attackBox = {
+                    x: player.direction > 0 ? player.x + player.width : player.x - 40,
+                    y: player.y + 10,
+                    w: 40,
+                    h: 30
+                };
+                playSound('hit');
+            }
+
+            if ((keys['k'] || keys['x']) && player.grounded) {
+                player.vy = -player.jumpForce;
+                player.grounded = false;
+                playSound('jump');
+            }
+
+            if (keys['l'] || keys['c']) {
+                if (player.energy >= player.maxEnergy) {
+                    player.energy = 0;
+                    player.state = 'skill';
+                    player.attackBox = {
+                        x: player.direction > 0 ? player.x : player.x - 150,
+                        y: player.y - 20,
+                        w: 150,
+                        h: 80
+                    };
+                    playSound('skill');
+                    // 能量波特效
+                    for (let i = 0; i < 20; i++) {
+                        particles.push({
+                            x: player.x + player.width/2,
+                            y: player.y + player.height/2,
+                            vx: player.direction * (5 + Math.random() * 5),
+                            vy: (Math.random() - 0.5) * 5,
+                            size: 4 + Math.random() * 4,
+                            color: '#ffaa00',
+                            life: 1
+                        });
+                    }
+                }
+            }
+
+            if (keys[' ']) {
+                player.state = 'dash';
+                player.vx = player.direction * 10;
+                player.invincible = 15;
+            }
+        }
+
+        // 攻击状态更新
+        if (player.state === 'attack' || player.state === 'skill') {
+            player.attackFrame++;
+            if (player.attackFrame > 15) {
+                player.state = 'idle';
+                player.attackBox = null;
+            }
+
+            // 检测攻击命中
+            if (player.attackBox && player.attackFrame < 10) {
+                for (const e of enemies) {
+                    if (e.invincible > 0) continue;
+                    const atk = player.attackBox;
+                    if (atk.x < e.x + e.width && atk.x + atk.w > e.x &&
+                        atk.y < e.y + e.height && atk.y + atk.h > e.y) {
+                        const dmg = player.state === 'skill' ? 30 : 15;
+                        e.hp -= dmg;
+                        e.invincible = 20;
+                        e.state = 'hurt';
+                        hitStop = 3;
+                        screenShake = 5;
+                        playSound('hit');
+
+                        // 击退
+                        e.x += player.direction * 20;
+                        e.y -= 5;
+
+                        // 粒子
+                        for (let i = 0; i < 5; i++) {
+                            particles.push({
+                                x: e.x + e.width/2,
+                                y: e.y + e.height/2,
+                                vx: (Math.random() - 0.5) * 10,
+                                vy: (Math.random() - 0.5) * 10,
+                                size: 4,
+                                color: e.color,
+                                life: 1
+                            });
+                        }
+
+                        // 伤害数字
+                        damageNumbers.push({
+                            x: e.x + e.width/2,
+                            y: e.y,
+                            text: dmg.toString(),
+                            color: '#ffff00',
+                            life: 30
+                        });
+
+                        if (e.hp <= 0) {
+                            playSound('enemyDeath');
+                            player.energy = Math.min(player.energy + 10, player.maxEnergy);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 物理更新
+        player.vy += 0.8; // 重力
+        player.x += player.vx;
+        player.y += player.vy;
+
+        // 边界
+        if (player.x < levelWalls.left) player.x = levelWalls.left;
+        if (player.x > levelWalls.right - player.width) player.x = levelWalls.right - player.width;
+
+        // 地面
+        if (player.y > 400 - player.height) {
+            player.y = 400 - player.height;
+            player.vy = 0;
+            player.grounded = true;
+        }
+
+        // 相机跟随
+        const targetCam = player.x - 300;
+        cameraX += (targetCam - cameraX) * 0.1;
+        if (cameraX < 0) cameraX = 0;
+
+        // 敌人更新
+        for (let i = enemies.length - 1; i >= 0; i--) {
+            const e = enemies[i];
+            e.frame++;
+            if (e.invincible > 0) e.invincible--;
+
+            if (e.hp <= 0) {
+                enemies.splice(i, 1);
+                continue;
+            }
+
+            // AI
+            const dist = player.x - e.x;
+            const absDist = Math.abs(dist);
+
+            if (e.type === 'grunt') {
+                if (absDist > 40) {
+                    e.x += dist > 0 ? e.speed : -e.speed;
+                    e.state = 'walk';
+                } else if (e.attackCooldown <= 0) {
+                    e.state = 'attack';
+                    e.attackCooldown = 60;
+                    if (Math.abs(player.x - e.x) < 50 && Math.abs(player.y - e.y) < 50) {
+                        player.hp -= e.damage;
+                        player.invincible = 30;
+                        screenShake = 8;
+                        hitStop = 5;
+                        damageNumbers.push({
+                            x: player.x + player.width/2,
+                            y: player.y,
+                            text: e.damage.toString(),
+                            color: '#ff0000',
+                            life: 30
+                        });
+                    }
+                }
+            } else if (e.type === 'ranger') {
+                if (absDist < 200) {
+                    e.x -= dist > 0 ? e.speed : -e.speed;
+                }
+                e.state = 'walk';
+                if (e.attackCooldown <= 0) {
+                    e.attackCooldown = 90;
+                    // 投掷飞刀
+                    particles.push({
+                        x: e.x + e.width/2,
+                        y: e.y + e.height/2,
+                        vx: dist > 0 ? 8 : -8,
+                        vy: 0,
+                        size: 8,
+                        color: '#44ff66',
+                        life: 60,
+                        damage: e.damage,
+                        isProjectile: true
+                    });
+                }
+            } else if (e.type === 'brute') {
+                if (absDist > 60) {
+                    e.x += dist > 0 ? e.speed : -e.speed;
+                    e.state = 'walk';
+                } else if (e.attackCooldown <= 0) {
+                    e.state = 'attack';
+                    e.attackCooldown = 120;
+                    // 重击
+                    setTimeout(() => {
+                        if (Math.abs(player.x - e.x) < 80) {
+                            player.hp -= e.damage;
+                            player.invincible = 30;
+                            screenShake = 10;
+                            hitStop = 5;
+                            damageNumbers.push({
+                                x: player.x + player.width/2,
+                                y: player.y,
+                                text: e.damage.toString(),
+                                color: '#ff0000',
+                                life: 30
+                            });
+                        }
+                    }, 300);
+                }
+            }
+
+            if (e.attackCooldown > 0) e.attackCooldown--;
+            if (e.state === 'hurt' && e.invincible < 15) e.state = 'walk';
+        }
+
+        // 投射物更新
+        for (let i = particles.length - 1; i >= 0; i--) {
+            const p = particles[i];
+            p.x += p.vx;
+            p.y += p.vy;
+            p.life -= 0.02;
+
+            if (p.isProjectile) {
+                // 检测与玩家碰撞
+                if (player.invincible <= 0 &&
+                    p.x > player.x && p.x < player.x + player.width &&
+                    p.y > player.y && p.y < player.y + player.height) {
+                    player.hp -= p.damage;
+                    player.invincible = 30;
+                    screenShake = 8;
+                    damageNumbers.push({
+                        x: player.x + player.width/2,
+                        y: player.y,
+                        text: p.damage.toString(),
+                        color: '#ff0000',
+                        life: 30
+                    });
+                    p.life = 0;
+                }
+            }
+
+            if (p.life <= 0) particles.splice(i, 1);
+        }
+
+        // 伤害数字更新
+        for (let i = damageNumbers.length - 1; i >= 0; i--) {
+            damageNumbers[i].y -= 1;
+            damageNumbers[i].life--;
+            if (damageNumbers[i].life <= 0) damageNumbers.splice(i, 1);
+        }
+
+        // 波次管理
+        if (enemies.length === 0) {
+            wave++;
+            if (wave > 10) {
+                gameState = GameState.WIN;
+            } else {
+                spawnWave();
+            }
+        }
+
+        // 玩家死亡
+        if (player.hp <= 0) {
+            gameState = GameState.GAMEOVER;
+        }
+
+        if (screenShake > 0) ctx.restore();
+    }
+
+    // 主循环
+    function gameLoop() {
+        // 清屏
+        ctx.fillStyle = '#000';
+        ctx.fillRect(0, 0, 800, 450);
+
+        if (gameState === GameState.MENU) {
+            drawMenu();
+        } else if (gameState === GameState.PLAYING) {
+            update();
+            ctx.save();
+            ctx.translate(-cameraX, 0);
+            drawBackground();
+            drawPlayer();
+            for (const e of enemies) drawEnemy(e);
+            drawParticles();
+            ctx.restore();
+            drawUI();
+        } else if (gameState === GameState.PAUSED) {
+            ctx.save();
+            ctx.translate(-cameraX, 0);
+            drawBackground();
+            drawPlayer();
+            for (const e of enemies) drawEnemy(e);
+            ctx.restore();
+            drawUI();
+            drawPaused();
+        } else if (gameState === GameState.GAMEOVER) {
+            ctx.save();
+            ctx.translate(-cameraX, 0);
+            drawBackground();
+            ctx.restore();
+            drawGameOver();
+        } else if (gameState === GameState.WIN) {
+            ctx.save();
+            ctx.translate(-cameraX, 0);
+            drawBackground();
+            ctx.restore();
+            drawWin();
+        }
+
+        requestAnimationFrame(gameLoop);
+    }
+
+    // 启动
+    gameLoop();
+    </script>
+
+<style>
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+}
+
+.inland-security-footer {
+  position: fixed;
+  z-index: 10;
+  bottom: 0;
+  right: 0;
+  width: fit-content;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.tooltip-container {
+  position: relative;
+}
+
+.trigger-content {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  padding: 8px;
+  background-color: transparent;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.minimax-link {
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+  font-weight: 300;
+  color: #adadad;
+  text-decoration: none;
+}
+
+.minimax-link:visited {
+  color: #adadad;
+}
+
+.minimax-link:hover {
+  color: #666666;
+}
+
+.tooltip-content {
+  position: absolute;
+  bottom: 100%;
+  right: 0;
+  display: none;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 8px;
+  padding-bottom: 16px; /* 8px 内容间距 + 8px 用于鼠标移动的透明区域 */
+  font-size: 12px;
+  line-height: 17px;
+  background-color: #fafafa;
+  border-radius: 12px;
+  white-space: nowrap;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+  color: #171717;
+}
+
+/* 创建透明的连接区域，让鼠标可以平滑移动到 tooltip */
+.tooltip-content::after {
+  content: '';
+  position: absolute;
+  bottom: -8px;
+  left: 0;
+  right: 0;
+  height: 16px;
+}
+
+.tooltip-container:hover .tooltip-content {
+  display: flex;
+}
+
+.info-section {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 12px;
+}
+
+.beian-link {
+  display: flex;
+  align-items: center;
+  text-decoration: none;
+  color: #171717;
+}
+
+.beian-icon {
+  width: 14px;
+  height: 14px;
+  margin-right: 2px;
+}
+
+.underline-text {
+  color: #171717;
+  text-decoration: underline;
+}
+
+.underline-text:hover {
+  color: #000000;
+}
+
+/* 深色模式支持 */
+@media (prefers-color-scheme: dark) {
+  .trigger-content {
+    background-color: transparent;
+  }
+
+  .minimax-link,
+  .minimax-link:visited {
+    color: #666666;
+  }
+
+  .minimax-link:hover {
+    color: #adadad;
+  }
+
+  .tooltip-content {
+    background-color: #262626;
+    color: #ededed;
+  }
+
+  .beian-link,
+  .underline-text {
+    color: #ededed;
+  }
+
+  .underline-text:hover {
+    color: #ffffff;
+  }
+}
+
+</style>
+<div class="inland-security-footer">
+  <div class="tooltip-container">
+    <div class="trigger-content">
+      <a href="https://www.minimaxi.com/" target="_blank" rel="noreferrer" class="minimax-link">
+        <span>© 2026 MiniMax</span>
+      </a>
+    </div>
+    <div class="tooltip-content">
+      <section class="info-section">
+        <span>上海稀宇科技有限公司</span>
+      </section>
+
+      <section class="info-section">
+        <a class="beian-link" href="https://www.beian.gov.cn/portal/registerSystemInfo?recordcode=31010402010179" target="_blank" rel="noreferrer">
+          <img alt="hailuo-beian-icon" src="https://cdn.hailuoai.com/hailuo-video-web/public_assets/223037d3-79fd-4db0-a456-749f38a6a14b.png" class="beian-icon">
+          <span class="underline-text">沪公网安备31010402010179号</span>
+        </a>
+        <a href="https://beian.miit.gov.cn/" target="_blank" rel="noreferrer" class="underline-text">
+          沪ICP备2023003282号-38
+        </a>
+      </section>
+
+      <section class="info-section">
+        <span>模型名称：MiniMax</span>
+        <span>备案号：Shanghai-MiniMax-202505230046</span>
+      </section>
+
+      <section class="info-section">
+        <a href="https://agent.minimaxi.com/doc/zh/terms-of-service.html" target="_blank" rel="noreferrer" class="underline-text">
+          用户协议
+        </a>
+        <a href="https://agent.minimaxi.com/doc/zh/privacy-policy.html" target="_blank" rel="noreferrer" class="underline-text">
+          隐私政策
+        </a>
+      </section>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>
